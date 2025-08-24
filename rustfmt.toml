@@ -1,0 +1,3 @@
+indent_style = "Block"
+trailing_comma = "Never"
+tab_spaces = 2
