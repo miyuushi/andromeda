@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+andromeda-common = { path = "../andromeda-common" }
 andromeda-lib = { path = "../andromeda-lib" }
 windows = { version = "0.61.3", features = ["Win32_System_LibraryLoader", "Win32_Devices_HumanInterfaceDevice"] }

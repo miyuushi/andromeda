@@ -1,3 +1,8 @@
 indent_style = "Block"
 trailing_comma = "Never"
 tab_spaces = 2
+binop_separator = "Back"
+max_width = 120
+brace_style = "SameLineWhere"
+control_brace_style = "AlwaysSameLine"
+single_line_if_else_max_width = 70

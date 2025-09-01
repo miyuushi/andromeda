@@ -20,7 +20,7 @@ type DirectInput8CreateFn = unsafe extern "system" fn(
 
 fn main() {
   // DLL name (null-terminated C string)
-  let dll_name = std::ffi::CString::new("dinput8.dll").unwrap();
+  let dll_name = CString::new("dinput8.dll").unwrap();
 
   unsafe {
     let handle = LoadLibraryA(PCSTR(dll_name.as_ptr() as *const u8)).unwrap();
@@ -28,8 +28,6 @@ fn main() {
     if handle.0.is_null() {
       panic!("Failed to load DLL.");
     }
-
-    // thread::sleep(Duration::from_secs(3));
 
     let func_name = CString::new("DirectInput8Create").unwrap();
     let proc = GetProcAddress(handle, PCSTR(func_name.as_ptr() as *const u8));

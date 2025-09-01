@@ -9,9 +9,18 @@ crate-type = ["cdylib"]
 
 [dependencies]
 andromeda-entry = { path = "../andromeda-entry" }
+andromeda-common = { path = "../andromeda-common" }
+ash = "0.38.0"
 egui = "0.32.1"
-minhook = "0.8.0"
+egui-directx11 = "0.10.0"
+humantime = "2.2.0"
+log = { workspace = true }
+fern = { workspace = true }
+chrono = { workspace = true }
+min_hook_rs = "2.1.0"
 once_cell = "1.21.3"
+widestring = "1.2.0"
+windows-core = "0.61.2"
 
 [dependencies.windows]
 version = "0.61.3"

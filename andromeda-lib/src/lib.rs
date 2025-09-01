@@ -1,12 +1,23 @@
+mod egui_backend;
 mod exports;
+mod hooks;
+mod internal;
 mod util;
 
-use minhook::MinHook;
-use std::{error::Error, ffi::c_void, ptr, thread, time::Duration};
+use andromeda_common::{
+  errors::AndromedaError,
+  exports::{D3D11CreateDeviceAndSwapChainFn, D3D11CreateDeviceFn},
+  get_andromeda_config_path, get_andromeda_log_path,
+  logging::{andromeda_file_logging_format, andromeda_stdout_logging_format}
+};
+use chrono::Local;
+use log::info;
+use std::{error::Error, ffi::c_void, fmt, fs::OpenOptions, io, ptr, sync::Mutex, thread, time::Duration};
 use windows::{
   Win32::{
     Foundation::HINSTANCE,
     System::{
+      LibraryLoader::{GetModuleHandleA, GetProcAddress},
       SystemServices::DLL_PROCESS_ATTACH,
       Threading::{CreateThread, THREAD_CREATION_FLAGS}
     }
@@ -15,59 +26,75 @@ use windows::{
 };
 
 use crate::{
-  exports::{DXGICreateFactoryFn, ORIG_DXGI_CREATE_FACTORY, hooked_dxgi_create_factory},
-  util::{get_module_symbol_address, log}
+  hooks::try_install_dx11_hooks,
+  internal::{INTERFACES, interfaces::Interfaces},
+  util::log
 };
 
-pub fn add(left: u64, right: u64) -> u64 {
-  left + right
+unsafe fn try_install_hooks() -> Result<(), AndromedaError> {
+  info!("Attempt to hook functions with MinHook");
+  min_hook_rs::initialize()?;
+
+  for _ in 0..40 {
+    if unsafe { try_install_dx11_hooks().is_ok() } {
+      info!("Hooked DX11 functions successfully!");
+      return Ok(());
+    }
+
+    thread::sleep(Duration::from_millis(50));
+  }
+
+  Err(AndromedaError::Hooking("Failed to install any hooks!".to_string()))
 }
 
-unsafe fn install_hooks() {
-  log("[Andromeda] Attempt to hook functions with MinHook");
-  let hook_dxgi_create_factory = |address: usize| unsafe {
-    let target: DXGICreateFactoryFn = std::mem::transmute(address);
-    let trampoline = MinHook::create_hook(target as _, hooked_dxgi_create_factory as _)
-      .expect("Failed to hook DXGICreateFactory!");
+pub fn init_logger() -> Result<(), AndromedaError> {
+  let log_dir = get_andromeda_log_path().unwrap_or_else(|| "logs".into());
 
-    ORIG_DXGI_CREATE_FACTORY.get_or_init(|| std::mem::transmute(trampoline));
-    MinHook::enable_hook(target as _).unwrap();
-  };
+  let log_file = OpenOptions::new()
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(log_dir.join("Andromeda.Entry.log"))?;
 
-  let dxgi_create_factory_address = get_module_symbol_address("dxgi.dll", "DXGICreateFactory");
-  match dxgi_create_factory_address {
-    None => {
-      log("[Andromeda] dxgi.dll not loaded in this process (GetModuleHandleA returned NULL).")
-    }
-    Some(address) => hook_dxgi_create_factory(address)
-  }
+  let logger = fern::Dispatch::new()
+    .level(log::LevelFilter::Debug);
 
-  for _ in 0..10 {
-    let dxgi_create_factory_address = get_module_symbol_address("dxgi.dll", "DXGICreateFactory");
-    if let Some(address) = dxgi_create_factory_address {
-      log("[Andromeda] dxgi.dll found on retry; attempting hook again if needed");
-      hook_dxgi_create_factory(address);
-      break;
-    }
-    thread::sleep(Duration::from_millis(200));
-  }
+  // Output to stdout and files
+  let file_config = fern::Dispatch::new()
+    .format(andromeda_file_logging_format)
+    .chain(log_file);
+  let stdout_config = fern::Dispatch::new()
+    .format(andromeda_stdout_logging_format)
+    .chain(std::io::stdout());
 
-  log("[Andromeda] DXGICreateFactory hooked");
-}
-
-unsafe fn initialize() -> Result<(), Box<dyn Error>> {
-  unsafe {
-    install_hooks();
-  }
+  logger.chain(file_config).chain(stdout_config).apply()?;
 
   Ok(())
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "system" fn inject_andromeda_entrypoint() -> bool {
+  // Initialize singletons
+  INTERFACES.get_or_init(|| Mutex::new(Interfaces::new()));
+
+  match init_logger() {
+    Ok(_) => info!("Logger initialized!"),
+    Err(e) => println!("Failed to initialize logger! {e}")
+  }
+
+  // Setup Andromeda and install hooks
+  unsafe {
+    try_install_hooks();
+  }
+
+  true
 }
 
 unsafe extern "system" fn thread_main(_: *mut c_void) -> u32 {
   log("[Andromeda] thread_main running");
   // A console may be useful for printing to 'stdout'
   unsafe {
-    initialize();
+    inject_andromeda_entrypoint();
   }
 
   log("[Andromeda] thread_main finished");
@@ -80,46 +107,44 @@ pub unsafe extern "system" fn DllMain(_module: HINSTANCE, call_reason: u32, _: *
   if call_reason == DLL_PROCESS_ATTACH {
     log("[Andromeda] DllMain: PROCESS_ATTACH");
 
-    // Preferably a thread should be created here instead, since as few
-    // operations as possible should be performed within `DllMain`.
+    // unsafe {
+    //   let mut cookie: *mut c_void = std::ptr::null_mut();
+    //   let status = LdrRegisterDllNotification(0, dll_notify, std::ptr::null_mut(), &mut cookie);
+    //   if status.0 != 0 {
+    //       println!("[-] Failed to register DLL notification: 0x{:X}", status.0);
+    //   } else {
+    //       println!("[+] DLL notification registered");
+    //   }
 
-    unsafe {
-      let handle = CreateThread(
-        None,
-        0,
-        Some(thread_main),
-        None,
-        THREAD_CREATION_FLAGS(0),
-        None
-      );
+    //   // Call LdrUnregisterDllNotification(cookie) when your DLL unloads
+    // }
 
-      if handle.is_err() {
-        // fallback: try std::thread if CreateThread failed (unlikely)
-        log("[Andromeda] CreateThread failed; falling back to std::thread");
-        std::thread::spawn(|| unsafe {
-          match crate::thread_main(ptr::null_mut()) {
-            0 => 0,
-            err => {
-              println!("[Andromeda] Error occurred when injecting: {}", err);
-              1
-            }
-          }
-        });
-      } else {
-        log("[Andromeda] background thread spawned");
-      }
-    }
+    // unsafe {
+    //   let handle = CreateThread(
+    //     None,
+    //     0,
+    //     Some(thread_main),
+    //     None,
+    //     THREAD_CREATION_FLAGS(0),
+    //     None
+    //   );
+
+    //   if handle.is_err() {
+    //     // fallback: try std::thread if CreateThread failed (unlikely)
+    //     log("[Andromeda] CreateThread failed; falling back to std::thread");
+    //     std::thread::spawn(|| {
+    //       match crate::thread_main(ptr::null_mut()) {
+    //         0 => 0,
+    //         err => {
+    //           println!("[Andromeda] Error occurred when injecting: {}", err);
+    //           1
+    //         }
+    //       }
+    //     });
+    //   } else {
+    //     log("[Andromeda] background thread spawned");
+    //   }
+    // }
   }
   true.into()
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn it_works() {
-    let result = add(2, 2);
-    assert_eq!(result, 4);
-  }
 }

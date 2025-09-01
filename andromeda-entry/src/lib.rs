@@ -1,23 +1,37 @@
-use windows::Win32::System::SystemServices::{
-  DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH
+mod entrypoint;
+mod patches;
+mod util;
+mod utils;
+
+use andromeda_common::errors::AndromedaError;
+use andromeda_common::logging::{andromeda_file_logging_format, andromeda_stdout_logging_format};
+use andromeda_common::utils::win32;
+use andromeda_common::{
+  AndromedaConfig, create_andromeda_config, get_andromeda_config, get_andromeda_config_path, get_andromeda_loader_path,
+  get_andromeda_log_path
 };
-use windows::core::{GUID, HRESULT, IUnknown, PCSTR, PCWSTR};
-use windows::{
-  Win32::Foundation::*, Win32::System::LibraryLoader::*,
-  Win32::System::SystemInformation::GetSystemDirectoryW,
-  Win32::UI::WindowsAndMessaging::MessageBoxA
-};
-// use retour::static_detour;
-use minhook::{MH_STATUS, MinHook};
+use log::{error, info};
 use once_cell::sync::OnceCell;
 use std::error::Error;
 use std::ffi::c_void;
-use std::fmt;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
-use std::sync::OnceLock;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::{ffi::CString, ffi::c_int, iter, mem};
+use std::{fmt, io};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_FEATURE_LEVEL};
+use windows::Win32::Graphics::Direct3D11::{D3D11_CREATE_DEVICE_FLAG, ID3D11Device, ID3D11DeviceContext};
+use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+use windows::Win32::System::SystemServices::{
+  DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH
+};
+use windows::Win32::System::Threading::{CreateThread, THREAD_CREATION_FLAGS};
+use windows::core::{GUID, HRESULT, IUnknown, PCSTR, PCWSTR};
+use windows::{Win32::Foundation::*, Win32::System::LibraryLoader::*};
+
+use crate::patches::apply_all_patches;
+use crate::utils::win32::module::LoadedModule;
 
 type DirectInput8CreateFn = unsafe extern "system" fn(
   hinst: HINSTANCE,
@@ -27,107 +41,224 @@ type DirectInput8CreateFn = unsafe extern "system" fn(
   punk_outer: *mut IUnknown
 ) -> HRESULT;
 
-static ORIGINAL_DIRECT_INPUT8_CREATE: OnceCell<DirectInput8CreateFn> = OnceCell::new();
-static REAL_DLL: OnceLock<usize> = OnceLock::new();
-static LOADED_PAYLOAD: OnceLock<()> = OnceLock::new();
+static PAYLOAD_LOADED: AtomicBool = AtomicBool::new(false);
+static H_MODULE: OnceLock<Mutex<LoadedModule>> = OnceLock::new();
 
-#[derive(Debug, Clone)]
-struct ProxyError(String);
+type InjectAndromedaEntrypointFn = unsafe extern "system" fn() -> bool;
 
-impl fmt::Display for ProxyError {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}", self.0)
+fn ensure_payload_loaded(config: AndromedaConfig) -> Result<(), AndromedaError> {
+  if PAYLOAD_LOADED.load(Ordering::Acquire) {
+    return Ok(());
   }
-}
+  const PAYLOAD_NAME: &str = "andromeda.dll";
+  let loader_path = get_andromeda_loader_path(config).map_or(PAYLOAD_NAME.into(), |path| path.join(PAYLOAD_NAME));
+  let loader_path = loader_path
+    .to_str()
+    .ok_or_else(|| AndromedaError::Path("Invalid payload path was specified".to_string()))?;
+  info!("Loader path: {}", loader_path);
+  let wide = win32::widestring(loader_path);
 
-impl Error for ProxyError {}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn DirectInput8Create(
-  hinst: HINSTANCE,
-  dw_version: u32,
-  riidltf: *const GUID,
-  ppv_out: *mut *mut c_void,
-  punk_outer: *mut IUnknown
-) -> HRESULT {
   unsafe {
-    let _ = windows::Win32::System::Console::AllocConsole();
-  }
-  println!("[Proxy] DirectInput8Create called (dw_version={dw_version})");
-  unsafe {
-    let _ = load_real_dll();
-  }
-
-  LOADED_PAYLOAD.get_or_init(|| {
-    let custom_path =
-      "/home/mimi/Documents/Projects/andromeda/target/x86_64-pc-windows-gnu/debug/andromeda.dll";
-    let wide: Vec<u16> = custom_path.encode_utf16().chain([0]).collect();
-    unsafe {
-      let _ = LoadLibraryW(PCWSTR::from_raw(wide.as_ptr()));
+    let payload = LoadLibraryW(PCWSTR::from_raw(wide.as_ptr()));
+    if let Ok(payload) = payload {
+      let proc = GetProcAddress(
+        payload,
+        PCSTR(
+          CString::new("inject_andromeda_entrypoint")
+            .expect("CString had internal null byte present")
+            .as_ptr() as *const u8
+        )
+      );
+      if let Some(proc) = proc {
+        let inject_andromeda_entrypoint: InjectAndromedaEntrypointFn = std::mem::transmute(proc);
+        inject_andromeda_entrypoint();
+      }
+    } else if let Err(err) = payload {
+      error!("Error loading payload!: {}", err);
     }
-  });
-
-  let result = unsafe {
-    ORIGINAL_DIRECT_INPUT8_CREATE.get().unwrap()(hinst, dw_version, riidltf, ppv_out, punk_outer)
-  };
-
-  if result.is_ok() && !ppv_out.is_null() {
-    println!("[Proxy] Got IDirectInput8 interface at {ppv_out:?}");
-    // At this point you could wrap or hook the returned COM object
+    // Mark payload as loaded even on failure to prevent retry storming
+    PAYLOAD_LOADED.store(true, Ordering::Release);
   }
-
-  result
+  Ok(())
 }
 
-/// Called when the DLL is attached to the process.
-unsafe fn load_real_dll() -> Result<(), Box<dyn Error>> {
-  if REAL_DLL.get().is_some() {
-    return Err(Box::new(ProxyError(
-      "Can't load real DLL twice!".to_owned()
-    )));
+fn init_console() -> io::Result<()> {
+  unsafe {
+    // Allocate a new console
+    windows::Win32::System::Console::AllocConsole()?;
+
+    let mode = CString::new("w").unwrap();
+    let conout = CString::new("CONOUT$").unwrap();
+
+    // Attach stdout/stderr to the console
+    libc::freopen(
+      conout.as_ptr(),
+      mode.as_ptr(),
+      libc::fdopen(libc::STDOUT_FILENO, mode.as_ptr())
+    );
+    libc::freopen(
+      conout.as_ptr(),
+      mode.as_ptr(),
+      libc::fdopen(libc::STDERR_FILENO, mode.as_ptr())
+    );
   }
-
-  let system_path = get_system32_path();
-  let module_name = Path::new(&system_path).join("dinput8.dll");
-  let address = get_module_symbol_address(module_name.to_str().unwrap(), "DirectInput8Create")
-    .expect("Could not find 'DirectInput8Create' address");
-
-  REAL_DLL.set(address).unwrap();
-
-  unsafe { ORIGINAL_DIRECT_INPUT8_CREATE.get_or_init(|| std::mem::transmute(address)) };
 
   Ok(())
 }
 
-pub fn get_system32_path() -> String {
-  // Allocate a buffer for the path (MAX_PATH characters)
-  let mut buffer = [0u16; MAX_PATH as usize];
+pub fn init_logger() -> Result<(), AndromedaError> {
+  let log_dir = get_andromeda_log_path().unwrap_or_else(|| "logs".into());
 
-  unsafe {
-    let len = GetSystemDirectoryW(Some(&mut buffer));
-    if len == 0 {
-      panic!("Failed to get system directory");
-    }
+  let log_file = OpenOptions::new()
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(log_dir.join("Andromeda.Entry.log"))?;
 
-    // Convert UTF-16 buffer to Rust String
-    let path = String::from_utf16_lossy(&buffer[..len as usize]);
-    println!("System directory: {}", path);
+  let logger = fern::Dispatch::new()
+    .level(log::LevelFilter::Debug);
 
-    path
-  }
+  // Output to stdout and files
+  let file_config = fern::Dispatch::new()
+    .format(andromeda_file_logging_format)
+    .chain(log_file);
+  let stdout_config = fern::Dispatch::new()
+    .format(andromeda_stdout_logging_format)
+    .chain(std::io::stdout());
+
+  logger.chain(file_config).chain(stdout_config).apply()?;
+
+  Ok(())
 }
 
-/// Returns a module symbol's absolute address.
-fn get_module_symbol_address(module: &str, symbol: &str) -> Option<usize> {
-  let module = module
-    .encode_utf16()
-    .chain(iter::once(0))
-    .collect::<Vec<u16>>();
-  let symbol = CString::new(symbol).unwrap();
+unsafe extern "system" fn thread_main(_: *mut c_void) -> u32 {
   unsafe {
-    let handle = LoadLibraryW(PCWSTR(module.as_ptr() as _)).unwrap();
-    GetProcAddress(handle, PCSTR(symbol.as_ptr() as _)).map(|func| func as usize)
+    init_console();
   }
+  min_hook_rs::initialize();
+
+  // let log_dir = get_andromeda_log_path().unwrap_or_else(|| "logs".into());
+
+  // let log_file = OpenOptions::new()
+  //   .write(true)
+  //   .create(true)
+  //   .truncate(true)
+  //   .open(log_dir.join("Andromeda.Entry.log"));
+
+  // // current log will always be Andromeda.Entry.log
+  // let file_appender =rolling::daily(&log_dir, "Andromeda.Entry.log");
+  // let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+  // let stdout_layer = layer()
+  //   .with_writer(std::io::stdout)
+  //   .with_timer(ChronoLocal::rfc_3339())
+  //   .with_target(false) // hide target if you want
+  //   .with_level(true);
+  // let file_layer = layer()
+  //   .with_writer(non_blocking)
+  //   .with_timer(ChronoLocal::new(
+  //     // similar to your "%Y-%m-%d_%H-%M-%S"
+  //     (|| Local::now().format("%Y-%m-%d_%H-%M-%S").to_string())()
+  //   ))
+  //   .with_target(true)
+  //   .with_level(true);
+
+  // let logger = tracing_subscriber::registry()
+  //   .with(
+  //     EnvFilter::builder()
+  //       .with_default_directive(LevelFilter::INFO.into())
+  //       .from_env_lossy()
+  //   )
+  //   .with(stdout_layer)
+  //   .with(file_layer)
+  //   .init();
+
+  // let logger = flexi_logger::Logger::try_with_env_or_str("info").and_then(|l| {
+  //   l.log_to_file(
+  //     FileSpec::default()
+  //       .directory(
+  //         get_andromeda_config_path()
+  //           .map(|c| c.join("logs"))
+  //           .unwrap_or("logs".into())
+  //       )
+  //       .basename("Andromeda.Entry")
+  //   )
+  //   .log_to_stdout()
+  //   .write_mode(WriteMode::Direct)
+  //   .format(andromeda_logging_format)
+  //   .rotate(
+  //     Criterion::Age(Age::Day),
+  //     Naming::TimestampsCustomFormat { current_infix: None, format: "%Y-%m-%d_%H-%M-%S" },
+  //     Cleanup::KeepLogFiles(20)
+  //   )
+  //   .start()
+  // });
+
+  match init_logger() {
+    Ok(_) => info!("Logger initialized!"),
+    Err(ref e) => error!("Failed to initialize logger! {e}")
+  }
+
+  let config = match get_andromeda_config() {
+    Some(config) => config,
+    None => create_andromeda_config().unwrap_or_default()
+  };
+
+  info!("Successfully created or read config: {:?}", config);
+
+  // match manual_map_dll("andromeda.dll") {
+  //   Ok(addr) => {
+  //     error!("Manual-mapped at {:p}", addr);
+  //   }
+  //   Err(e) => {
+  //     eerror!("Manual map failed: {}", e);
+  //   }
+  // }
+  apply_all_patches();
+
+  let _ = ensure_payload_loaded(config);
+
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn DllMain(
+  _hinst: windows::Win32::Foundation::HINSTANCE,
+  reason: u32,
+  _reserved: *mut std::ffi::c_void
+) -> i32 {
+  if reason == DLL_PROCESS_ATTACH {
+    unsafe {
+      DisableThreadLibraryCalls(_hinst.into());
+      let handle = CreateThread(None, 0, Some(thread_main), None, THREAD_CREATION_FLAGS(0), None);
+
+      if handle.is_err() {
+        // fallback: try std::thread if CreateThread failed (unlikely)
+        error!("CreateThread failed; falling back to std::thread");
+        std::thread::spawn(|| match crate::thread_main(std::ptr::null_mut()) {
+          0 => 0,
+          err => {
+            error!("Error occurred when injecting: {}", err);
+            1
+          }
+        });
+      } else {
+        info!("Background thread spawned");
+      }
+    }
+
+    H_MODULE.get_or_init(|| Mutex::new(LoadedModule::default()));
+    let module = H_MODULE.get();
+    if let Some(m) = module {
+      if let Ok(mut h) = m.lock() {
+        h.handle.attach(_hinst.into(), false);
+      }
+    }
+    // let result = unsafe { patch_entry_point_for_injection(GetCurrentProcess()) };
+
+    // unsafe { (*result).LoadInstalledXivAlexDllOnly = true };
+  }
+  1
 }
 
 // DirectInput8Create=FORWARDER_DirectInput8Create		@1
