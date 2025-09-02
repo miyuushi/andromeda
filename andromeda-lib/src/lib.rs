@@ -5,14 +5,24 @@ mod internal;
 mod util;
 
 use andromeda_common::{
+  api::{get_game, get_game_version},
+  config::{StartupConfig, get_andromeda_log_path},
   errors::AndromedaError,
   exports::{D3D11CreateDeviceAndSwapChainFn, D3D11CreateDeviceFn},
-  get_andromeda_config_path, get_andromeda_log_path,
   logging::{andromeda_file_logging_format, andromeda_stdout_logging_format}
 };
 use chrono::Local;
 use log::info;
-use std::{error::Error, ffi::c_void, fmt, fs::OpenOptions, io, ptr, sync::Mutex, thread, time::Duration};
+use std::{
+  error::Error,
+  ffi::{CString, c_void},
+  fmt,
+  fs::OpenOptions,
+  io, ptr,
+  sync::Mutex,
+  thread,
+  time::Duration
+};
 use windows::{
   Win32::{
     Foundation::HINSTANCE,
@@ -54,10 +64,9 @@ pub fn init_logger() -> Result<(), AndromedaError> {
     .write(true)
     .create(true)
     .truncate(true)
-    .open(log_dir.join("Andromeda.Entry.log"))?;
+    .open(log_dir.join("Andromeda.log"))?;
 
-  let logger = fern::Dispatch::new()
-    .level(log::LevelFilter::Debug);
+  let logger = fern::Dispatch::new().level(log::LevelFilter::Debug);
 
   // Output to stdout and files
   let file_config = fern::Dispatch::new()
@@ -73,7 +82,7 @@ pub fn init_logger() -> Result<(), AndromedaError> {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "system" fn inject_andromeda_entrypoint() -> bool {
+unsafe extern "system" fn inject_andromeda_entrypoint(startup_config: StartupConfig) -> bool {
   // Initialize singletons
   INTERFACES.get_or_init(|| Mutex::new(Interfaces::new()));
 
@@ -81,6 +90,16 @@ unsafe extern "system" fn inject_andromeda_entrypoint() -> bool {
     Ok(_) => info!("Logger initialized!"),
     Err(e) => println!("Failed to initialize logger! {e}")
   }
+
+  let process_name = CString::from_raw(startup_config.process_name);
+  let version = CString::from_raw(startup_config.version);
+  let game = get_game(&process_name.to_string_lossy());
+
+  info!(
+    "Game: {:?}, Game version: {:?}",
+    game,
+    get_game_version(&game, &version.to_string_lossy())
+  );
 
   // Setup Andromeda and install hooks
   unsafe {
@@ -94,7 +113,7 @@ unsafe extern "system" fn thread_main(_: *mut c_void) -> u32 {
   log("[Andromeda] thread_main running");
   // A console may be useful for printing to 'stdout'
   unsafe {
-    inject_andromeda_entrypoint();
+    inject_andromeda_entrypoint(StartupConfig::default());
   }
 
   log("[Andromeda] thread_main finished");

@@ -11,6 +11,18 @@ use windows::Win32::{
   }
 };
 
+pub mod xiv {
+  use std::{fs, path::PathBuf};
+
+  use log::info;
+
+  pub(crate) fn read_game_version(game_path: PathBuf) -> Option<String> {
+    let parent = game_path.parent().expect("Could not get parent directory");
+    let version_path = parent.join("ffxivgame.ver");
+    fs::read_to_string(version_path).ok()
+  }
+}
+
 pub(crate) struct LoadedModule {
   m_h_module: HMODULE
 }

@@ -3,13 +3,13 @@ mod patches;
 mod util;
 mod utils;
 
+use andromeda_common::api::{Game, get_game};
+use andromeda_common::config::{
+  AndromedaConfig, create_andromeda_config, get_andromeda_config, get_andromeda_loader_path, get_andromeda_log_path
+};
 use andromeda_common::errors::AndromedaError;
 use andromeda_common::logging::{andromeda_file_logging_format, andromeda_stdout_logging_format};
 use andromeda_common::utils::win32;
-use andromeda_common::{
-  AndromedaConfig, create_andromeda_config, get_andromeda_config, get_andromeda_config_path, get_andromeda_loader_path,
-  get_andromeda_log_path
-};
 use log::{error, info};
 use once_cell::sync::OnceCell;
 use std::error::Error;
@@ -30,8 +30,11 @@ use windows::Win32::System::Threading::{CreateThread, THREAD_CREATION_FLAGS};
 use windows::core::{GUID, HRESULT, IUnknown, PCSTR, PCWSTR};
 use windows::{Win32::Foundation::*, Win32::System::LibraryLoader::*};
 
+use crate::entrypoint::InjectAndromedaEntrypointFn;
 use crate::patches::apply_all_patches;
+use crate::util::xiv;
 use crate::utils::win32::module::LoadedModule;
+use crate::utils::win32::process::Process;
 
 type DirectInput8CreateFn = unsafe extern "system" fn(
   hinst: HINSTANCE,
@@ -43,8 +46,6 @@ type DirectInput8CreateFn = unsafe extern "system" fn(
 
 static PAYLOAD_LOADED: AtomicBool = AtomicBool::new(false);
 static H_MODULE: OnceLock<Mutex<LoadedModule>> = OnceLock::new();
-
-type InjectAndromedaEntrypointFn = unsafe extern "system" fn() -> bool;
 
 fn ensure_payload_loaded(config: AndromedaConfig) -> Result<(), AndromedaError> {
   if PAYLOAD_LOADED.load(Ordering::Acquire) {
@@ -71,7 +72,23 @@ fn ensure_payload_loaded(config: AndromedaConfig) -> Result<(), AndromedaError> 
       );
       if let Some(proc) = proc {
         let inject_andromeda_entrypoint: InjectAndromedaEntrypointFn = std::mem::transmute(proc);
-        inject_andromeda_entrypoint();
+        let process = Process::current();
+        let process_name = process
+          .base_name()
+          .map(|p| p.to_string_lossy().into_owned())
+          .unwrap_or_default();
+
+        let game_version = match get_game(&process_name) {
+          Game::Ffxiv => xiv::read_game_version(process.path_of().unwrap_or_default()),
+          _ => None
+        };
+
+        inject_andromeda_entrypoint(andromeda_common::config::StartupConfig {
+          process_name: CString::new(process_name)
+            .expect("CString had internal null byte present")
+            .into_raw(),
+          version: CString::new(game_version.unwrap_or_default()).unwrap().into_raw()
+        });
       }
     } else if let Err(err) = payload {
       error!("Error loading payload!: {}", err);
@@ -115,8 +132,7 @@ pub fn init_logger() -> Result<(), AndromedaError> {
     .truncate(true)
     .open(log_dir.join("Andromeda.Entry.log"))?;
 
-  let logger = fern::Dispatch::new()
-    .level(log::LevelFilter::Debug);
+  let logger = fern::Dispatch::new().level(log::LevelFilter::Debug);
 
   // Output to stdout and files
   let file_config = fern::Dispatch::new()
