@@ -1,3 +1,3 @@
 # Andromeda
 
-Library and plugin framework for hooking and overriding game functions to draw overlays and write plugins
+Plugin framework and API for hooking and overriding game functions to draw overlays and create plugins
